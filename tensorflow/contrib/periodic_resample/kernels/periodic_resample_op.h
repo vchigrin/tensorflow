@@ -26,129 +26,13 @@
 #include "tensorflow/core/framework/tensor_shape.h"
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/util/work_sharder.h"
+#include "tensorflow/contrib/periodic_resample/kernels/input_indexer.h"
 
-namespace {
-
-class InputIndexer {
- public:
-  InputIndexer(const std::vector<tensorflow::int64>& target_dimensions,
-               const std::vector<tensorflow::int64>& original_dimensions,
-               int adjustable_dimension,
-               const std::vector<tensorflow::int64>& dimension_ceiling,
-               const std::vector<tensorflow::int64>& cumulative_dimensions,
-               int rank)
-
-    : target_dimensions_(target_dimensions),
-      adjustable_dimension_(adjustable_dimension),
-      dimension_ceiling_(dimension_ceiling),
-      cumulative_dimensions_(cumulative_dimensions),
-      rank_(rank),
-      current_output_index_(0),
-      current_input_index_(0),
-      adjustable_dimension_carriage_sum_(0) {
-    output_indices_.resize(target_dimensions_.size());
-    clamped_output_indices_.resize(target_dimensions_.size());
-
-    // Compute index_factors
-    index_factors_.resize(rank);
-    tensorflow::int64 last_index_factor = 1;
-    for (auto r = rank_ - 1; r >= 0; --r) {
-      index_factors_[r] = last_index_factor;
-      last_index_factor *= original_dimensions[r];
-    }
-  }
-
-  tensorflow::int64 current_input_index() const {
-    return current_input_index_;
-  }
-
-  void MoveToOutputIndex(tensorflow::int64 output_index);
-  void IncrementOutputIndex();
-
- private:
-  void RecomputeClampedAdjustableDimensionIndex() {
-    tensorflow::int64 index = adjustable_dimension_carriage_sum_;
-    index *= target_dimensions_[adjustable_dimension_];
-    index += output_indices_[adjustable_dimension_];
-    clamped_output_indices_[adjustable_dimension_] = index;
-  }
-
-  const std::vector<tensorflow::int64> target_dimensions_;
-  const int adjustable_dimension_;
-  const std::vector<tensorflow::int64> dimension_ceiling_;
-  std::vector<tensorflow::int64> index_factors_;
-  const std::vector<tensorflow::int64> cumulative_dimensions_;
-  const int rank_;
-  tensorflow::int64 current_output_index_;
-  tensorflow::int64 current_input_index_;
-  tensorflow::int64 adjustable_dimension_carriage_sum_;
-  std::vector<tensorflow::int64> output_indices_;
-  std::vector<tensorflow::int64> clamped_output_indices_;
-};
-
-void InputIndexer::MoveToOutputIndex(tensorflow::int64 output_index) {
-  current_output_index_ = output_index;
-  current_input_index_ = 0;
-
-  // un-rasterize the output index
-  auto last_reduced_i = output_index;
-  for (auto r = rank_ - 1; r >= 0; --r) {
-    output_indices_[r] = last_reduced_i % target_dimensions_[r];
-    last_reduced_i =
-        (last_reduced_i - output_indices_[r]) / target_dimensions_[r];
-  }
-
-  tensorflow::int64 carriage_sum = 0;
-  for (int qi = 0; qi < rank_; ++qi) {
-    if (qi == adjustable_dimension_)
-      continue;
-    carriage_sum += cumulative_dimensions_[qi] *
-             (output_indices_[qi] % dimension_ceiling_[qi]);
-  }
-  adjustable_dimension_carriage_sum_ = carriage_sum;
-
-  // rasterize the input index
-  for (auto r = rank_ - 1; r >= 0; --r) {
-    if (r != adjustable_dimension_)
-      clamped_output_indices_[r] = output_indices_[r] / dimension_ceiling_[r];
-    else {
-      RecomputeClampedAdjustableDimensionIndex();
-    }
-  }
-  for (auto r = rank_ - 1; r >= 0; --r) {
-    current_input_index_ += index_factors_[r] * clamped_output_indices_[r];
-  }
-}
-
-void InputIndexer::IncrementOutputIndex() {
-  current_output_index_++;
-  // un-rasterize the output index
-  for (auto r = rank_ - 1; r >= 0; --r) {
-    auto old_carriage_sum_increment = cumulative_dimensions_[r] * (output_indices_[r] % dimension_ceiling_[r]);
-    output_indices_[r] = (output_indices_[r] + 1) % target_dimensions_[r];
-    if (r != adjustable_dimension_) {
-      auto new_output_index = output_indices_[r] / dimension_ceiling_[r];
-      current_input_index_ += (new_output_index - clamped_output_indices_[r]) * index_factors_[r];
-
-      clamped_output_indices_[r] = new_output_index;
-
-      auto new_carriage_sum_increment = cumulative_dimensions_[r] * (output_indices_[r] % dimension_ceiling_[r]);
-
-      adjustable_dimension_carriage_sum_ = adjustable_dimension_carriage_sum_ - old_carriage_sum_increment + new_carriage_sum_increment;
-    }
-
-    if (output_indices_[r] != 0) {
-      // No more carries to higher indices.
-      break;
-    }
-  }
-  auto old_clamped_output_index = clamped_output_indices_[adjustable_dimension_];
-  RecomputeClampedAdjustableDimensionIndex();
-  current_input_index_ += (clamped_output_indices_[adjustable_dimension_] - old_clamped_output_index) * index_factors_[adjustable_dimension_];
-}
+using CPUDevice = Eigen::ThreadPoolDevice;
+using GPUDevice = Eigen::GpuDevice;
 
 template <typename IndexVecT>
-void process_desired_shape(
+inline void process_desired_shape(
     tensorflow::OpKernelContext* context,
     const tensorflow::TensorShape& input_tensor_shape,
     const IndexVecT& desired_shape,
@@ -193,7 +77,7 @@ void process_desired_shape(
       new_sliced_size * (*target_dimensions)[*adjustable_dimension];
 }
 
-std::vector<tensorflow::int64> tensor_shape_to_vector(
+inline std::vector<tensorflow::int64> tensor_shape_to_vector(
     const tensorflow::TensorShape& tensor_shape) {
   std::vector<tensorflow::int64> result(tensor_shape.dims());
   int count = 0;
@@ -204,7 +88,7 @@ std::vector<tensorflow::int64> tensor_shape_to_vector(
   return result;
 }
 
-std::vector<tensorflow::int64> compute_dimension_ceiling(
+inline std::vector<tensorflow::int64> compute_dimension_ceiling(
     const std::vector<tensorflow::int64>& target_dimensions,
     const std::vector<tensorflow::int64>& original_dimensions) {
   std::vector<tensorflow::int64> dimension_ceiling(original_dimensions.size());
@@ -215,7 +99,7 @@ std::vector<tensorflow::int64> compute_dimension_ceiling(
   return dimension_ceiling;
 }
 
-std::vector<tensorflow::int64> compute_cumulative_dimensions(
+inline std::vector<tensorflow::int64> compute_cumulative_dimensions(
     const tensorflow::TensorShape& tensor_shape,
     const std::vector<tensorflow::int64>& dimension_ceiling) {
   std::vector<tensorflow::int64> cumulative_dimensions(tensor_shape.dims());
@@ -234,7 +118,161 @@ std::vector<tensorflow::int64> compute_cumulative_dimensions(
 // Heuristic number based on measurements on development machine.
 const tensorflow::int64 costPerFillIndex = 75;
 
-template <class InputDataT,
+template<typename Device, typename InputDataT>
+class FillPeriodicTensorImpl {
+ public:
+  void operator()(
+      int rank,
+      int adjustable_dimension,
+      const std::vector<tensorflow::int64>& target_dimensions,
+      const std::vector<tensorflow::int64>& dimension_ceiling,
+      const std::vector<tensorflow::int64>& cumulative_dimensions,
+      const std::vector<tensorflow::int64>& original_dimensions,
+      tensorflow::OpKernelContext* context,
+      const InputDataT* input,
+      InputDataT* output,
+      tensorflow::int64 output_size);
+};
+
+template<typename Device, typename InputDataT>
+class FillGradTensorImpl {
+ public:
+  void operator()(
+      int rank,
+      int adjustable_dimension,
+      const std::vector<tensorflow::int64>& target_dimensions,
+      const std::vector<tensorflow::int64>& dimension_ceiling,
+      const std::vector<tensorflow::int64>& cumulative_dimensions,
+      const std::vector<tensorflow::int64>& original_dimensions,
+      tensorflow::OpKernelContext* context,
+      const InputDataT* input_grad_data,
+      InputDataT* output,
+      tensorflow::int64 new_size);
+};
+
+template<typename InputDataT>
+class FillPeriodicTensorImpl<CPUDevice, InputDataT> {
+ public:
+  void operator()(
+      int rank,
+      int adjustable_dimension,
+      const std::vector<tensorflow::int64>& target_dimensions,
+      const std::vector<tensorflow::int64>& dimension_ceiling,
+      const std::vector<tensorflow::int64>& cumulative_dimensions,
+      const std::vector<tensorflow::int64>& original_dimensions,
+      tensorflow::OpKernelContext* context,
+      const InputDataT* input,
+      InputDataT* output,
+      tensorflow::int64 output_size) {
+
+    // Fill output tensor with periodically resampled input tensor values
+    InputIndexer::VariableRankState indexer_state(
+        rank,
+        adjustable_dimension,
+        target_dimensions,
+        dimension_ceiling,
+        cumulative_dimensions);
+    indexer_state.InitializeIndexFactors(original_dimensions);
+
+    InputIndexer input_indexer(&indexer_state);
+    auto worker_threads = *(context->device()->tensorflow_cpu_worker_threads());
+    auto fill_output_tensor = [&input_indexer, &output, &input](
+        tensorflow::int64 start, tensorflow::int64 limit) {
+      InputIndexer local_indexer(input_indexer);
+      local_indexer.MoveToOutputIndex(start);
+      for (tensorflow::int64 output_index = start; output_index < limit;
+           ++output_index) {
+        output[output_index] = input[local_indexer.current_input_index()];
+        local_indexer.IncrementOutputIndex();
+      }
+    };
+
+    ::tensorflow::Shard(worker_threads.num_threads, worker_threads.workers,
+                        output_size, costPerFillIndex, fill_output_tensor);
+  }
+};
+
+template<typename InputDataT>
+class FillGradTensorImpl<CPUDevice, InputDataT> {
+ public:
+  void operator()(
+      int rank,
+      int adjustable_dimension,
+      const std::vector<tensorflow::int64>& target_dimensions,
+      const std::vector<tensorflow::int64>& dimension_ceiling,
+      const std::vector<tensorflow::int64>& cumulative_dimensions,
+      const std::vector<tensorflow::int64>& original_dimensions,
+      tensorflow::OpKernelContext* context,
+      const InputDataT* input_grad_data,
+      InputDataT* output,
+      tensorflow::int64 new_size) {
+  InputIndexer::VariableRankState indexer_state(
+      rank,
+      adjustable_dimension,
+      target_dimensions,
+      dimension_ceiling,
+      cumulative_dimensions);
+  indexer_state.InitializeIndexFactors(original_dimensions);
+
+  InputIndexer input_indexer(&indexer_state);
+
+  auto worker_threads = *(context->device()->tensorflow_cpu_worker_threads());
+  auto fill_output_tensor = [&input_indexer, &output, &input_grad_data](
+      tensorflow::int64 start, tensorflow::int64 limit) {
+    InputIndexer local_indexer(input_indexer);
+    local_indexer.MoveToOutputIndex(start);
+    for (tensorflow::int64 input_grad_index = start; input_grad_index < limit;
+         ++input_grad_index) {
+      output[local_indexer.current_input_index()] =
+          input_grad_data[input_grad_index];
+      local_indexer.IncrementOutputIndex();
+    }
+  };
+
+  ::tensorflow::Shard(worker_threads.num_threads, worker_threads.workers,
+                      new_size, costPerFillIndex, fill_output_tensor);
+}
+};
+
+
+#if GOOGLE_CUDA
+
+template<typename InputDataT>
+class FillPeriodicTensorImpl<GPUDevice, InputDataT> {
+ public:
+  void operator()(
+      int rank,
+      int adjustable_dimension,
+      const std::vector<tensorflow::int64>& target_dimensions,
+      const std::vector<tensorflow::int64>& dimension_ceiling,
+      const std::vector<tensorflow::int64>& cumulative_dimensions,
+      const std::vector<tensorflow::int64>& original_dimensions,
+      tensorflow::OpKernelContext* context,
+      const InputDataT* input,
+      InputDataT* output,
+      tensorflow::int64 output_size);
+};
+
+template<typename InputDataT>
+class FillGradTensorImpl<GPUDevice, InputDataT> {
+ public:
+  void operator()(
+      int rank,
+      int adjustable_dimension,
+      const std::vector<tensorflow::int64>& target_dimensions,
+      const std::vector<tensorflow::int64>& dimension_ceiling,
+      const std::vector<tensorflow::int64>& cumulative_dimensions,
+      const std::vector<tensorflow::int64>& original_dimensions,
+      tensorflow::OpKernelContext* context,
+      const InputDataT* input_grad_data,
+      InputDataT* output,
+      tensorflow::int64 new_size);
+};
+
+#endif  // GOOGLE_CUDA
+
+template <typename Device,
+          class InputDataT,
           class IndexVecT>  // both types are needed here b/c IndexVecT and
                             // InputDataT are not related
                             void
@@ -290,32 +328,20 @@ template <class InputDataT,
                  context->allocate_output(0, output_shape, &output_tensor));
   auto output = output_tensor->flat<InputDataT>();
 
-  // Fill output tensor with periodically resampled input tensor values
-  InputIndexer input_indexer(target_dimensions,
-                            original_dimensions,
-                            adjustable_dimension,
-                            dimension_ceiling,
-                            cumulative_dimensions,
-                            rank);
-
-
-  auto worker_threads = *(context->device()->tensorflow_cpu_worker_threads());
-  auto fill_output_tensor = [&input_indexer, &output, &input](
-      tensorflow::int64 start, tensorflow::int64 limit) {
-    InputIndexer local_indexer(input_indexer);
-    local_indexer.MoveToOutputIndex(start);
-    for (tensorflow::int64 output_index = start; output_index < limit;
-         ++output_index) {
-      output(output_index) = input(local_indexer.current_input_index());
-      local_indexer.IncrementOutputIndex();
-    }
-  };
-
-  ::tensorflow::Shard(worker_threads.num_threads, worker_threads.workers,
-                      new_size, costPerFillIndex, fill_output_tensor);
+  FillPeriodicTensorImpl<Device, InputDataT> filler;
+  filler(rank,
+         adjustable_dimension,
+         target_dimensions,
+         dimension_ceiling,
+         cumulative_dimensions,
+         original_dimensions,
+         context,
+         input.data(),
+         output.data(),
+         new_size);
 }
 
-template <class InputDataT>
+template <typename Device, typename InputDataT>
 void fill_grad_tensor(tensorflow::OpKernelContext* context,
                       const tensorflow::TensorShape& original_shape,
                       const tensorflow::PartialTensorShape& desired_shape,
@@ -365,32 +391,22 @@ void fill_grad_tensor(tensorflow::OpKernelContext* context,
   // Fill output tensor with periodically resampled input tensor values
   // input is a strided array (last index is fastest, C-ordered)
   auto input_grad_data = grad_tensor.flat<InputDataT>();
-  InputIndexer input_indexer(target_dimensions,
-                             original_dimensions,
-                             adjustable_dimension,
-                             dimension_ceiling,
-                             cumulative_dimensions,
-                             rank);
 
-
-  auto worker_threads = *(context->device()->tensorflow_cpu_worker_threads());
-  auto fill_output_tensor = [&input_indexer, &output, &input_grad_data](
-      tensorflow::int64 start, tensorflow::int64 limit) {
-    InputIndexer local_indexer(input_indexer);
-    local_indexer.MoveToOutputIndex(start);
-    for (tensorflow::int64 input_grad_index = start; input_grad_index < limit;
-         ++input_grad_index) {
-      output(local_indexer.current_input_index()) =
-          input_grad_data(input_grad_index);
-      local_indexer.IncrementOutputIndex();
-    }
-  };
-
-  ::tensorflow::Shard(worker_threads.num_threads, worker_threads.workers,
-                      new_size, costPerFillIndex, fill_output_tensor);
+  FillGradTensorImpl<Device, InputDataT> filler;
+  filler(rank,
+         adjustable_dimension,
+         target_dimensions,
+         dimension_ceiling,
+         cumulative_dimensions,
+         original_dimensions,
+         context,
+         input_grad_data.data(),
+         output.data(),
+         new_size);
 }
 
-void create_output_tensor(
+template<typename Device>
+inline void create_output_tensor(
     tensorflow::OpKernelContext* context,
     const tensorflow::Tensor& input_tensor,
     const tensorflow::DataType& input_tensor_type,
@@ -400,25 +416,26 @@ void create_output_tensor(
   // obligatory type switch
   switch (input_tensor_type) {
     case tensorflow::DataTypeToEnum<float>::value:
-      fill_periodic_tensor<float>(context, desired_shape, input_tensor);
+      fill_periodic_tensor<Device, float>(context, desired_shape, input_tensor);
       break;
     case tensorflow::DataTypeToEnum<double>::value:
-      fill_periodic_tensor<double>(context, desired_shape, input_tensor);
+      fill_periodic_tensor<Device, double>(context, desired_shape, input_tensor);
       break;
     case tensorflow::DataTypeToEnum<tensorflow::int32>::value:
-      fill_periodic_tensor<tensorflow::int32>(context, desired_shape,
-                                              input_tensor);
+      fill_periodic_tensor<Device, tensorflow::int32>(context, desired_shape,
+                                                      input_tensor);
       break;
     case tensorflow::DataTypeToEnum<tensorflow::int64>::value:
-      fill_periodic_tensor<tensorflow::int64>(context, desired_shape,
-                                              input_tensor);
+      fill_periodic_tensor<Device, tensorflow::int64>(context, desired_shape,
+                                                      input_tensor);
       break;
     default:;
   }
 }
 
 
-void create_grad_tensor(
+template<typename Device>
+inline void create_grad_tensor(
     tensorflow::OpKernelContext* context,
     const tensorflow::Tensor& grad_tensor,
     const tensorflow::DataType& grad_tensor_type,
@@ -427,27 +444,26 @@ void create_grad_tensor(
   // obligatory type switch
   switch (grad_tensor_type) {
     case tensorflow::DataTypeToEnum<float>::value:
-      fill_grad_tensor<float>(
+      fill_grad_tensor<Device, float>(
           context, original_shape, desired_shape, grad_tensor);
       break;
     case tensorflow::DataTypeToEnum<double>::value:
-      fill_grad_tensor<double>(
+      fill_grad_tensor<Device, double>(
           context, original_shape, desired_shape, grad_tensor);
       break;
     case tensorflow::DataTypeToEnum<tensorflow::int32>::value:
-      fill_grad_tensor<tensorflow::int32>(
+      fill_grad_tensor<Device, tensorflow::int32>(
           context, original_shape, desired_shape, grad_tensor);
       break;
     case tensorflow::DataTypeToEnum<tensorflow::int64>::value:
-      fill_grad_tensor<tensorflow::int64>(
+      fill_grad_tensor<Device, tensorflow::int64>(
           context, original_shape, desired_shape, grad_tensor);
       break;
     default:;
   }
 }
 
-}  // namespace
-
+template<typename Device>
 class PeriodicResampleOp : public tensorflow::OpKernel {
  public:
   explicit PeriodicResampleOp(tensorflow::OpKernelConstruction* context)
@@ -461,8 +477,8 @@ class PeriodicResampleOp : public tensorflow::OpKernel {
     const tensorflow::Tensor& input_tensor = context->input(0);
     const tensorflow::DataType input_tensor_type = context->input_dtype(0);
 
-    create_output_tensor(context, input_tensor, input_tensor_type,
-                         desired_shape);
+    create_output_tensor<Device>(context, input_tensor, input_tensor_type,
+                                 desired_shape);
   }
 
  private:
@@ -470,6 +486,7 @@ class PeriodicResampleOp : public tensorflow::OpKernel {
 };
 
 
+template<typename Device>
 class PeriodicResampleOpGrad : public tensorflow::OpKernel {
  public:
   explicit PeriodicResampleOpGrad(tensorflow::OpKernelConstruction* context)
@@ -481,7 +498,7 @@ class PeriodicResampleOpGrad : public tensorflow::OpKernel {
   void Compute(tensorflow::OpKernelContext* context) override {
     const tensorflow::Tensor& grad_tensor = context->input(0);
     const tensorflow::DataType grad_tensor_type = context->input_dtype(0);
-    create_grad_tensor(
+    create_grad_tensor<Device>(
         context, grad_tensor, grad_tensor_type, original_shape, desired_shape);
   }
 

@@ -31,6 +31,12 @@ tf_custom_op_library(
         ":custom_op_headers",
         ":custom_op_sources",
     ],
+    gpu_srcs = [
+        "kernels/periodic_resample_op.cu.cc",
+        "kernels/periodic_resample_op.h",
+        "kernels/input_indexer.h",
+        "kernels/input_indexer.cc",
+    ]
 )
 
 tf_gen_op_libs(
@@ -111,6 +117,7 @@ filegroup(
         exclude = [
             "ops/*_test.cc",
             "kernels/*_test.cc",
+            "kernels/*cu.cc",
         ],
     ),
 )

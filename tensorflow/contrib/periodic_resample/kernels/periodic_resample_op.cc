@@ -21,11 +21,22 @@ namespace tensorflow {
 
 REGISTER_KERNEL_BUILDER(Name("PeriodicResample")
                             .Device(DEVICE_CPU),
-                        PeriodicResampleOp);
+                        PeriodicResampleOp<CPUDevice>);
 
 
 REGISTER_KERNEL_BUILDER(Name("PeriodicResampleOpGrad")
                             .Device(DEVICE_CPU),
-                        PeriodicResampleOpGrad);
+                        PeriodicResampleOpGrad<CPUDevice>);
+
+#ifdef GOOGLE_CUDA
+REGISTER_KERNEL_BUILDER(Name("PeriodicResample")
+                            .Device(DEVICE_GPU),
+                        PeriodicResampleOp<GPUDevice>);
+
+
+REGISTER_KERNEL_BUILDER(Name("PeriodicResampleOpGrad")
+                            .Device(DEVICE_GPU),
+                        PeriodicResampleOpGrad<GPUDevice>);
+#endif
 
 }  // namespace tensorflow

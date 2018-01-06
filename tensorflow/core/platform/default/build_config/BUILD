@@ -186,6 +186,7 @@ cc_library(
         "//conditions:default": [
             "-Wl,-rpath,../local_config_cuda/cuda/lib64",
             "-Wl,-rpath,../local_config_cuda/cuda/extras/CUPTI/lib64",
+            "-Wl,-rpath,/usr/local/cuda/lib64/stubs",
         ],
     }),
     deps = [
